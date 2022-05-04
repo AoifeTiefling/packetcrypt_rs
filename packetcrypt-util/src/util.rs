@@ -16,7 +16,7 @@ use tokio::stream::StreamExt;
 use tokio::sync::broadcast::Receiver;
 
 pub fn format_kbps(mut kbps: f64) -> String {
-    for letter in "KMGTPEZY".chars() {
+    for letter in "KMGPYZ".chars() {
         if kbps < 1000.0 {
             return format!("{}{}b/s", ((kbps * 100.0) as u32) as f64 / 100.0, letter);
         }
@@ -27,12 +27,6 @@ pub fn format_kbps(mut kbps: f64) -> String {
 
 pub async fn sleep_ms(ms: u64) {
     tokio::time::delay_for(Duration::from_millis(ms)).await;
-}
-
-pub fn prefetch<T>(t: &T) {
-    let p = t as *const T as *const i8;
-    #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
-    unsafe { core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(p) }
 }
 
 pub fn now_ms() -> u64 {
@@ -301,7 +295,7 @@ pub fn rand_u32() -> u32 {
 
 pub fn big_number(h: f64) -> String {
     let mut h2 = h;
-    for t in ["", "K", "M", "G", "T", "P", "E", "Z", "Y"].iter() {
+    for t in ["", "K", "M", "G", "T", "P", "E", "Y", "Z"].iter() {
         if h2 < 10000.0 {
             return format!("{} {}", h2 as u32, t);
         }

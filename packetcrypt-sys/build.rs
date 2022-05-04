@@ -58,7 +58,6 @@ fn main() {
             .header("bindings.h")
             .clang_args(&["-I", "packetcrypt/include"])
             .generate_comments(false)
-            .derive_default(true)
             .whitelist_function(".*")
             .whitelist_type("ExportMe")
             .generate()
@@ -99,20 +98,6 @@ fn main() {
         panic!("Could not find libsodium source code");
     }
 
-    if let Ok(pc_cc) = env::var("PC_CC") {
-        cfg.compiler(pc_cc);
-    }
-
-    if cfg.is_flag_supported("-fno-plt").unwrap() {
-        cfg.use_plt(false);
-    }
-
-    if !cfg!(feature = "portable") {
-        cfg.flag_if_supported("-march=native");
-        cfg.flag_if_supported("-mtune=native");
-        println!("cargo:warning=march=native is enabled, this build is non-portable");
-    }
-
     cfg.include("packetcrypt/include")
         .include("packetcrypt/src")
         .flag("-Wno-implicit-function-declaration")
@@ -130,13 +115,19 @@ fn main() {
         .file("packetcrypt/src/Work.c")
         .file("packetcrypt/src/ProofTree.c")
         .file("packetcrypt/src/BlockMine.c")
+        .file("packetcrypt/src/Work.c")
         .file("packetcrypt/src/UdpGso.c")
         .out_dir(dst.join("lib"))
-        .flag("-O2")
+        .opt_level(3)
         .compile("libpacketcrypt.a");
 
+    let src = env::current_dir().unwrap().join("packetcrypt");
     println!("cargo:root={}", dst.display());
     println!("cargo:include={}", dst.join("include").display());
-    println!("cargo:rerun-if-changed={}", env::current_dir().unwrap().to_string_lossy());
-    println!("cargo:rerun-if-env-changed=PC_CC");
+    for f in src.join("src").iter() {
+        println!("cargo:rerun-if-changed={}", f.to_string_lossy());
+    }
+    for f in src.join("include").join("packetcrypt").iter() {
+        println!("cargo:rerun-if-changed={}", f.to_string_lossy());
+    }
 }

@@ -140,10 +140,7 @@ impl BlkMiner {
             low_nonce: res.low_nonce,
         }
     }
-    pub fn request_stop(&self) {
-        unsafe { packetcrypt_sys::BlockMine_requestStop(self.miner) }
-    }
-    pub fn await_stop(&self) {
-        unsafe { packetcrypt_sys::BlockMine_awaitStop(self.miner) }
+    pub fn stop(&self) {
+        unsafe { packetcrypt_sys::BlockMine_stop(self.miner) }
     }
 }

@@ -65,6 +65,4 @@ void AnnMiner_stop(AnnMiner_t* miner);
  */
 void AnnMiner_free(AnnMiner_t* miner);
 
-double AnnMiner_hashesPerSecond(AnnMiner_t* ctx);
-
 #endif

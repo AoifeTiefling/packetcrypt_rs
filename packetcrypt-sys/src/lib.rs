@@ -2,8 +2,6 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 
-pub use sodiumoxide;
-
 pub mod difficulty;
 
 use bytes::{BufMut, BytesMut};

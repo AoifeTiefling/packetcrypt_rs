@@ -9,17 +9,14 @@ use packetcrypt_util::protocol::{AnnPostReply, BlockInfo};
 use packetcrypt_util::util;
 use std::cmp::max;
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::collections::VecDeque;
 use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver};
-use serde::{Deserialize};
 
 const RECENT_WORK_BUF: usize = 8;
 const MAX_ANN_BATCH_SIZE: usize = 1024;
-const MAX_MS_BETWEEN_POSTS: u64 = 10_000;
+const MAX_MS_BETWEEN_POSTS: u64 = 30_000;
 
 struct AnnBatch {
     parent_block_height: i32,
@@ -30,8 +27,8 @@ struct AnnBatch {
 struct Handler {
     tip: Mutex<AnnBatch>,
     url: Arc<String>,
-    queue: Arc<Mutex<VecDeque<AnnBatch>>>,
-    shutdown: AtomicBool,
+    recv_upload: tokio::sync::Mutex<Receiver<AnnBatch>>,
+    send_upload: Sender<AnnBatch>,
 }
 
 const STATS_SECONDS_TO_KEEP: usize = 10;
@@ -84,29 +81,7 @@ pub struct AnnMineCfg {
     pub mine_old_anns: i32,
 }
 
-#[derive(Deserialize)]
-pub struct AnnMineExternalConfig {
-    pub pools: Option<Vec<String>>,
-    pub threads: Option<usize>,
-    pub payment_addr: Option<String>,
-    pub uploaders: Option<usize>,
-    pub upload_timeout: Option<usize>,
-    pub mine_old_anns: Option<i32>,
-}
-impl AnnMineExternalConfig {
-    pub fn print(&self) {
-        println!("\n================ Configuration ================");
-        println!("      Pay Addrress: {}", self.payment_addr.clone().unwrap());
-        println!("           Pool(s): {}", self.pools.clone().unwrap().join("\n                    "));
-        println!("           Threads: {}", self.threads.unwrap());
-        println!("         Uploaders: {}", self.uploaders.unwrap());
-        println!("  Uploader Timeout: {}", self.upload_timeout.unwrap());
-        println!("     Mine Old Anns: {}", self.mine_old_anns.unwrap());
-        println!("===============================================\n");
-    }
-}
-
-const UPLOAD_CHANNEL_LEN: usize = 100;
+const UPLOAD_CHANNEL_LEN: usize = 200;
 
 const PREFETCH_HISTORY_DEPTH: i32 = 6;
 
@@ -123,7 +98,7 @@ pub async fn new(cfg: AnnMineCfg) -> Result<AnnMine> {
                     recent_work: [None; RECENT_WORK_BUF],
                     handlers: Vec::new(),
                 }),
-                pcli: poolclient::new(x, PREFETCH_HISTORY_DEPTH, 5),
+                pcli: poolclient::new(&x, PREFETCH_HISTORY_DEPTH, 30),
                 inflight_anns: AtomicUsize::new(0),
                 lost_anns: AtomicUsize::new(0),
                 accepted_anns: AtomicUsize::new(0),
@@ -198,16 +173,16 @@ fn update_work_cycle(am: &AnnMine, p: &Arc<Pool>, update: PoolUpdate) -> Vec<Arc
         }
         changes = true;
         info!("Adding handler {}", url);
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let (send_upload, recv_upload) = mpsc::channel(UPLOAD_CHANNEL_LEN);
         let h = Arc::new(Handler {
-            queue: queue,
+            recv_upload: tokio::sync::Mutex::new(recv_upload),
             tip: Mutex::new(AnnBatch {
                 create_time: util::now_ms(),
                 parent_block_height: job.header.height,
                 anns: Vec::new(),
             }),
             url: Arc::new(url.clone()),
-            shutdown: AtomicBool::new(false),
+            send_upload,
         });
         for _ in 0..am.cfg.uploaders {
             let p1 = Arc::clone(p);
@@ -281,7 +256,7 @@ async fn update_work_loop(am: &AnnMine, p: Arc<Pool>) {
             continue;
         };
         for to_shutdown in update_work_cycle(am, &p, update) {
-            to_shutdown.shutdown.store(true, Ordering::Relaxed);
+            to_shutdown.recv_upload.lock().await.close();
         }
     }
 }
@@ -290,6 +265,7 @@ fn submit_anns(
     p: &Pool,
     h: &Arc<Handler>,
     to_submit: &mut AnnBatch,
+    send_upload: &mut Sender<AnnBatch>,
     next_parent_block_height: i32,
 ) {
     let mut tip = AnnBatch {
@@ -298,19 +274,17 @@ fn submit_anns(
         anns: Vec::new(),
     };
     std::mem::swap(to_submit, &mut tip);
-    if tip.anns.len() == 0 {
-        return;
-    }
-    let mut queue = h.queue.lock().unwrap();
-    trace!("Queue {} anns at {} for {}, {} batches currently queued", tip.anns.len(), tip.parent_block_height, h.url, queue.len());
-    if queue.len() >= UPLOAD_CHANNEL_LEN {
-        let front = queue.pop_front();
-        if let Some(lost_batch) = front {
-            p.lost_anns.fetch_add(lost_batch.anns.len(), Ordering::Relaxed);
-            debug!("Dropping {} anns @ {} for {}", lost_batch.anns.len(), lost_batch.parent_block_height, h.url);
+    trace!("Submit [{}] to [{}]", tip.anns.len(), h.url);
+    match send_upload.try_send(tip) {
+        Ok(_) => (),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(tip)) => {
+            debug!("Failed to submit {} anns to {}", tip.anns.len(), h.url);
+            p.lost_anns.fetch_add(tip.anns.len(), Ordering::Relaxed);
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            warn!("Failed to submit anns to {}, channel closed", h.url);
         }
     }
-    queue.push_back(tip);
 }
 
 fn submit_to_pool(p: &Pool, ann_struct: &AnnResult, now: u64) {
@@ -344,6 +318,7 @@ fn submit_to_pool(p: &Pool, ann_struct: &AnnResult, now: u64) {
                 p,
                 &handler,
                 &mut *tip,
+                &mut handler.send_upload.clone(),
                 parent_block_height,
             );
         }
@@ -356,6 +331,7 @@ fn submit_to_pool(p: &Pool, ann_struct: &AnnResult, now: u64) {
             p,
             &handler,
             &mut *tip,
+            &mut handler.send_upload.clone(),
             parent_block_height,
         );
     }
@@ -572,38 +548,29 @@ async fn uploader_loop(am: &AnnMine, p: Arc<Pool>, h: Arc<Handler>) {
         .build()
         .unwrap();
     loop {
-        if h.shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-        let batch = {
-            let mut queue = h.queue.lock().unwrap();
-            queue.pop_back()
+        let batch = if let Some(x) = h.recv_upload.lock().await.recv().await {
+            x
+        } else {
+            info!("Uploader for {} shutting down", h.url);
+            return;
         };
-        match batch {
-            Some(batch) => {
-                let upload_n = am
-                    .upload_num
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let count = batch.anns.len();
-                p.inflight_anns.fetch_add(count, Ordering::Relaxed);
-                match upload_batch(am, &client, batch, &h.url, upload_n, &p).await {
-                    Ok(_) => (),
-                    Err(e) => {
-                        warn!(
-                            "[{}] Error uploading ann batch to {}: {}",
-                            upload_n, h.url, e
-                        );
-                        p.lost_anns.fetch_add(count, Ordering::Relaxed);
-                    }
-                };
-                p.inflight_anns.fetch_sub(count, Ordering::Relaxed);
+        let upload_n = am
+            .upload_num
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let count = batch.anns.len();
+        p.inflight_anns.fetch_add(count, Ordering::Relaxed);
+        match upload_batch(am, &client, batch, &h.url, upload_n, &p).await {
+            Ok(_) => (),
+            Err(e) => {
+                warn!(
+                    "[{}] Error uploading ann batch to {}: {}",
+                    upload_n, h.url, e
+                );
+                p.lost_anns.fetch_add(count, Ordering::Relaxed);
             }
-            None => {
-                util::sleep_ms(10).await;
-            }
-        }
+        };
+        p.inflight_anns.fetch_sub(count, Ordering::Relaxed);
     }
-    debug!("Uploader for {} shutting down", h.url);
 }
 
 pub async fn start(am: &AnnMine) -> Result<()> {
